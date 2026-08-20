@@ -1,438 +1,558 @@
 import io
+import time
 import requests
-import streamlit as st
+import numpy as np
 import pandas as pd
+import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="NSE VCP Scanner V2",
+    page_title="NSE VCP Scanner V3",
     page_icon="📈",
-    layout="wide"
+    layout="wide",
 )
 
-NSE_EQUITY_CSV = "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv"
+NSE_EQUITY_CSV = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
+LOOKBACK = 100
+DEFAULT_BATCH = 50
+MIN_RULES = 3
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def nse_symbols():
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "text/csv,*/*",
-        "Referer": "https://www.nseindia.com/"
-    }
-
     r = requests.get(
         NSE_EQUITY_CSV,
-        headers=headers,
-        timeout=20
+        headers={
+            "User-Agent": "Mozilla/5.0",
+            "Accept": "text/csv,*/*",
+        },
+        timeout=30,
     )
     r.raise_for_status()
 
     df = pd.read_csv(io.BytesIO(r.content))
 
-    col = "SYMBOL" if "SYMBOL" in df.columns else df.columns[0]
+    if "SYMBOL" not in df.columns:
+        raise ValueError("NSE symbol file format has changed.")
+
+    series_col = " SERIES" if " SERIES" in df.columns else "SERIES"
+    if series_col in df.columns:
+        df = df[df[series_col].astype(str).str.strip().eq("EQ")]
 
     return sorted(
-        df[col]
-        .dropna()
+        df["SYMBOL"]
         .astype(str)
         .str.strip()
-        .str.upper()
+        .dropna()
         .unique()
         .tolist()
     )
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def get_data(symbol):
-
-    df = yf.download(
-        symbol + ".NS",
-        period="2y",
-        interval="1d",
-        auto_adjust=False,
-        progress=False,
-        threads=False
-    )
-
-    if df is None or df.empty:
-        return pd.DataFrame()
+def clean_ohlcv(df):
+    if df is None or len(df) < 120:
+        return None
 
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
+        if len(df.columns.get_level_values(1).unique()) == 1:
+            df.columns = df.columns.get_level_values(0)
 
-    return df[
-        ["Open", "High", "Low", "Close", "Volume"]
-    ].dropna()
+    wanted = ["Open", "High", "Low", "Close", "Volume"]
+    lookup = {str(c).strip().title(): c for c in df.columns}
 
-
-def prepare(df):
-
-    x = df.copy()
-
-    x["SMA50"] = x.Close.rolling(50).mean()
-    x["SMA150"] = x.Close.rolling(150).mean()
-    x["SMA200"] = x.Close.rolling(200).mean()
-
-    x["SMA200_20"] = x.SMA200.shift(20)
-
-    tr = pd.concat(
-        [
-            x.High - x.Low,
-            (x.High - x.Close.shift()).abs(),
-            (x.Low - x.Close.shift()).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    x["ATRpct"] = (
-        100 * tr.rolling(14).mean() / x.Close
-    )
-
-    x["Vol20"] = x.Volume.rolling(20).mean()
-
-    x["High52"] = x.High.rolling(252).max()
-
-    return x.dropna()
-
-
-def contraction(series, n):
-
-    w = series.iloc[-n:]
-
-    return 100 * (w.max() - w.min()) / w.max()
-
-
-def scan(symbol):
-
-    df = get_data(symbol)
-
-    if len(df) < 260:
+    if not all(x in lookup for x in wanted):
         return None
 
-    x = prepare(df)
+    out = df[[lookup[x] for x in wanted]].copy()
+    out.columns = wanted
+    out = out.dropna()
 
-    if len(x) < 260:
+    if len(out) < 120:
         return None
 
-    r = x.iloc[-1]
+    return out
 
-    # RULE 1
-    trend_template = bool(
-        r.Close > r.SMA150 > r.SMA200
-        and r.SMA200 > r.SMA200_20
-        and r.SMA50 > r.SMA150
-        and r.Close >= 0.75 * r.High52
+
+def depth_percent(high, low):
+    if high <= 0:
+        return np.nan
+    return (high - low) / high * 100.0
+
+
+def find_contractions(df):
+    """
+    Detect distinct pullback/recovery structures inside the last 100
+    daily sessions. A neighbourhood of 3 sessions is used around
+    swing points so one sideways range is not split into many pieces.
+    """
+    d = df.tail(LOOKBACK).copy()
+
+    if len(d) < LOOKBACK:
+        return []
+
+    highs = d["High"].to_numpy(float)
+    lows = d["Low"].to_numpy(float)
+
+    swing_highs = []
+    swing_lows = []
+
+    for i in range(3, len(d) - 3):
+        if highs[i] >= highs[i - 3:i + 4].max():
+            swing_highs.append(i)
+
+        if lows[i] <= lows[i - 3:i + 4].min():
+            swing_lows.append(i)
+
+    candidates = []
+
+    for hi in swing_highs:
+        later_lows = [x for x in swing_lows if x > hi + 2]
+
+        if not later_lows:
+            continue
+
+        lo = later_lows[0]
+        depth = depth_percent(highs[hi], lows[lo])
+
+        # Ignore insignificant noise and extreme breakdowns.
+        if not np.isfinite(depth) or depth < 4 or depth > 45:
+            continue
+
+        later_highs = [x for x in swing_highs if x > lo + 2]
+
+        if not later_highs:
+            continue
+
+        recovery_high = later_highs[0]
+
+        # Require a meaningful recovery so the structure is not
+        # simply an unfinished decline.
+        recovery = (
+            highs[recovery_high] - lows[lo]
+        ) / max(highs[hi] - lows[lo], 1e-9)
+
+        if recovery < 0.55:
+            continue
+
+        candidates.append((hi, lo, recovery_high, depth))
+
+    candidates.sort(key=lambda x: x[2])
+
+    # Keep non-overlapping structures.
+    selected = []
+
+    for c in candidates:
+        if selected and c[0] <= selected[-1][2]:
+            # If overlapping, keep the tighter structure.
+            if c[3] < selected[-1][3]:
+                selected[-1] = c
+        else:
+            selected.append(c)
+
+    return selected[-5:]
+
+
+def contraction_rule(contractions):
+    """
+    Final contraction rule:
+    - 2 or 3 genuine contractions
+    - later contraction depth must be smaller
+    - structures must be separated, not pieces of one range
+    """
+    if len(contractions) < 2:
+        return False, []
+
+    recent = contractions[-3:]
+    depths = [x[3] for x in recent]
+
+    decreasing = all(
+        depths[i] < depths[i - 1]
+        for i in range(1, len(depths))
     )
 
-    # RULE 2
-    c1 = contraction(x.Close, 40)
-    c2 = contraction(x.Close, 25)
-    c3 = contraction(x.Close, 15)
-
-    tightening = bool(
-        c2 < 0.85 * c1
-        and c3 < 0.85 * c2
+    distinct = all(
+        recent[i][0] > recent[i - 1][2]
+        for i in range(1, len(recent))
     )
 
-    # RULE 3
-    atr_now = x.ATRpct.iloc[-10:].mean()
-    atr_old = x.ATRpct.iloc[-40:-10].mean()
+    return decreasing and distinct, depths
 
-    atr_contraction = bool(
-        atr_now < atr_old
+
+def volume_dryup(df, contractions):
+    if len(contractions) < 2:
+        return False
+
+    recent = contractions[-3:]
+    ratios = []
+
+    volume = df["Volume"].tail(LOOKBACK)
+
+    for hi, lo, _, _ in recent:
+        segment = volume.iloc[hi:lo + 1]
+
+        if len(segment) < 4:
+            return False
+
+        n = max(2, len(segment) // 3)
+
+        early = segment.iloc[:n].median()
+        late = segment.iloc[-n:].median()
+
+        if early <= 0:
+            return False
+
+        ratios.append(late / early)
+
+    return all(r <= 0.95 for r in ratios)
+
+
+def price_near_high_rule(df, contractions):
+    if not contractions:
+        return False
+
+    close = float(df["Close"].iloc[-1])
+    recent = contractions[-3:]
+
+    reference_highs = []
+
+    for hi, _, recovery_high, _ in recent:
+        reference_highs.append(float(df["High"].iloc[hi]))
+        reference_highs.append(float(df["High"].iloc[recovery_high]))
+
+    reference = max(reference_highs)
+
+    distance = abs(close / reference - 1.0) * 100.0
+
+    # The user's "0–10–20 from high" concept is treated as
+    # "near the high", with 20% as the outer tolerance.
+    return distance <= 20.0
+
+
+def sma_rule(df):
+    if len(df) < 110:
+        return False
+
+    close = float(df["Close"].iloc[-1])
+    sma50 = float(df["Close"].rolling(50).mean().iloc[-1])
+    sma100 = float(df["Close"].rolling(100).mean().iloc[-1])
+
+    return bool(
+        close > sma50
+        and sma50 > sma100
     )
 
-    # RULE 4
-    vol_now = x.Volume.iloc[-10:].mean()
-    vol_old = x.Volume.iloc[-50:-10].mean()
 
-    volume_dryup = bool(
-        vol_now < 0.85 * vol_old
+def ema_status(df):
+    ema50 = df["Close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    ema100 = df["Close"].ewm(span=100, adjust=False).mean().iloc[-1]
+    close = df["Close"].iloc[-1]
+
+    return {
+        "Price > 50 EMA": "YES" if close > ema50 else "NO",
+        "Price > 100 EMA": "YES" if close > ema100 else "NO",
+        "50 EMA > 100 EMA": "YES" if ema50 > ema100 else "NO",
+    }
+
+
+def cup_handle_indicator(df):
+    """
+    Cup-with-Handle is an indication only.
+    It is NEVER used as a filtering rule.
+    """
+    if len(df) < 120:
+        return False
+
+    d = df.tail(180)
+
+    if len(d) < 120:
+        return False
+
+    prices = d["Close"].to_numpy(float)
+    n = len(prices)
+
+    left = prices[: n // 3]
+    middle = prices[n // 3: 2 * n // 3]
+    right = prices[2 * n // 3:]
+
+    left_peak = float(np.max(left))
+    right_peak = float(np.max(right))
+    bottom = float(np.min(middle))
+
+    if left_peak <= 0 or right_peak <= 0:
+        return False
+
+    depth = (left_peak - bottom) / left_peak
+    symmetry = abs(right_peak / left_peak - 1.0)
+
+    # Broad structural indication, not a strict textbook classifier.
+    if not (0.12 <= depth <= 0.55):
+        return False
+
+    if symmetry > 0.18:
+        return False
+
+    recent = prices[-25:]
+    recent_peak = float(np.max(recent))
+    current = float(prices[-1])
+
+    handle_depth = (
+        recent_peak - current
+    ) / max(recent_peak, 1e-9)
+
+    return bool(
+        0.02 <= handle_depth <= 0.15
+        and current >= bottom * 1.10
     )
 
-    # RULE 5
-    pivot = float(
-        x.High.iloc[-20:].max()
-    )
 
-    pivot_distance = (
-        100 * (pivot - r.Close) / pivot
-    )
+def weekly_from_daily(df):
+    weekly = df.resample("W-FRI").agg({
+        "Open": "first",
+        "High": "max",
+        "Low": "min",
+        "Close": "last",
+        "Volume": "sum",
+    }).dropna()
 
-    near_pivot = bool(
-        0 <= pivot_distance <= 8
-    )
+    return weekly
 
-    # RULE 6
-    breakout = bool(
-        r.Close > pivot
-        and r.Volume > 1.5 * r.Vol20
-    )
+
+def analyse_stock(df):
+    d = clean_ohlcv(df)
+
+    if d is None:
+        return None
+
+    contractions = find_contractions(d)
+
+    contraction_pass, depths = contraction_rule(contractions)
+    volume_pass = volume_dryup(d, contractions)
+    high_pass = price_near_high_rule(d, contractions)
+    sma_pass = sma_rule(d)
 
     rules = {
-        "Trend template": trend_template,
-        "C1→C2→C3 tightening": tightening,
-        "ATR contraction": atr_contraction,
-        "Volume dry-up": volume_dryup,
-        "Near pivot (≤8%)": near_pivot,
-        "Breakout + 1.5x volume": breakout
+        "R1: 2–3 genuine contractions": contraction_pass,
+        "R2: Contraction volume dry-up": volume_pass,
+        "R3: Price near contraction/previous high": high_pass,
+        "R4: 50 SMA + 100 SMA trend": sma_pass,
     }
 
     passed = sum(rules.values())
 
-    # ONLY SHOW STOCKS WITH 3 OR MORE PASSED RULES
-    if passed < 3:
-        return None
+    ema = ema_status(d)
+
+    weekly = weekly_from_daily(d)
 
     return {
-        "Symbol": symbol,
-
-        "Passed": passed,
-
-        "Total rules": 6,
-
-        "Close": round(float(r.Close), 2),
-
-        "C1 %": round(c1, 2),
-
-        "C2 %": round(c2, 2),
-
-        "C3 %": round(c3, 2),
-
-        "ATR %": round(float(atr_now), 2),
-
-        "Pivot": round(pivot, 2),
-
-        "Pivot distance %":
-            round(float(pivot_distance), 2),
-
-        "Trend template":
-            "PASS" if trend_template else "FAIL",
-
-        "C1→C2→C3 tightening":
-            "PASS" if tightening else "FAIL",
-
-        "ATR contraction":
-            "PASS" if atr_contraction else "FAIL",
-
-        "Volume dry-up":
-            "PASS" if volume_dryup else "FAIL",
-
-        "Near pivot":
-            "PASS" if near_pivot else "FAIL",
-
-        "Breakout + volume":
-            "PASS" if breakout else "FAIL"
+        "Close": round(float(d["Close"].iloc[-1]), 2),
+        "Contractions": len(contractions),
+        "Depths": " → ".join(
+            f"{x:.1f}%" for x in depths
+        ),
+        "Rules Passed": passed,
+        "R1": "PASS" if rules["R1: 2–3 genuine contractions"] else "FAIL",
+        "R2": "PASS" if rules["R2: Contraction volume dry-up"] else "FAIL",
+        "R3": "PASS" if rules["R3: Price near contraction/previous high"] else "FAIL",
+        "R4": "PASS" if rules["R4: 50 SMA + 100 SMA trend"] else "FAIL",
+        **ema,
+        "Daily C&H": "YES" if cup_handle_indicator(d) else "NO",
+        "Weekly C&H": "YES" if cup_handle_indicator(weekly) else "NO",
     }
 
 
-# -----------------------------
-# APP
-# -----------------------------
+def download_batch(symbols):
+    tickers = [f"{s}.NS" for s in symbols]
 
-st.title("📈 NSE — Minervini VCP Scanner V2")
+    return yf.download(
+        tickers=tickers,
+        period="9mo",
+        interval="1d",
+        auto_adjust=False,
+        group_by="ticker",
+        threads=True,
+        progress=False,
+    )
+
+
+st.title("📈 NSE — Minervini VCP Scanner V3")
 
 st.caption(
-    "Shows stocks that pass 3 or more rules, "
-    "with PASS/FAIL shown for every rule."
+    "Rule-based investment research scanner. "
+    "It does not predict prices or place trades."
 )
 
-
 try:
-
     symbols = nse_symbols()
-
     st.success(
         f"NSE equity universe loaded: {len(symbols)} symbols"
     )
+except Exception as e:
+    st.error(f"Could not load NSE symbols: {e}")
+    st.stop()
 
-except Exception:
-
-    st.error(
-        "NSE symbol list could not be loaded right now."
-    )
-
-    symbols = []
-
-
-# SIDEBAR
 
 with st.sidebar:
+    st.subheader("Scanner settings")
 
-    st.subheader("Scan settings")
+    batch_size = st.number_input(
+        "Batch size",
+        min_value=10,
+        max_value=100,
+        value=DEFAULT_BATCH,
+        step=10,
+    )
 
-    max_scan = st.number_input(
-        "Stocks to scan",
-        min_value=50,
-        max_value=max(len(symbols), 50),
-        value=len(symbols) if symbols else 500,
-        step=50
+    min_rules = st.number_input(
+        "Minimum rules passed",
+        min_value=3,
+        max_value=4,
+        value=MIN_RULES,
+        step=1,
     )
 
     st.info(
-        "Only stocks passing 3 or more rules "
-        "will appear in the results."
-    )
-
-    st.warning(
-        "Full NSE scanning can take time because "
-        "historical data is requested for many stocks."
+        "All NSE symbols are scanned in batches. "
+        "A batch is only a technical download group; "
+        "the final result combines all batches."
     )
 
 
-# SCAN BUTTON
+if st.button(
+    "🔎 SCAN ALL NSE FOR VCP V3",
+    type="primary",
+    use_container_width=True,
+):
+    results = []
 
-if symbols:
+    total = len(symbols)
+    progress = st.progress(0)
+    status = st.empty()
 
-    if st.button(
-        "🔎 SCAN NSE FOR VCP V2",
-        type="primary",
-        use_container_width=True
-    ):
+    for start in range(0, total, int(batch_size)):
+        batch = symbols[
+            start:start + int(batch_size)
+        ]
 
-        selected = symbols[:int(max_scan)]
+        status.write(
+            f"Scanning {start + 1}–"
+            f"{min(start + len(batch), total)} "
+            f"of {total} stocks..."
+        )
 
-        rows = []
+        try:
+            raw = download_batch(batch)
 
-        errors = 0
+            for symbol in batch:
+                try:
+                    ticker = f"{symbol}.NS"
 
-        progress = st.progress(0)
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        level0 = raw.columns.get_level_values(0)
 
-        status = st.empty()
+                        if ticker not in level0:
+                            continue
 
-        for i, symbol in enumerate(selected, 1):
+                        one = raw[ticker].copy()
+                    else:
+                        one = raw.copy()
 
-            status.write(
-                f"Scanning {symbol} — "
-                f"{i}/{len(selected)}"
-            )
+                    analysis = analyse_stock(one)
 
-            try:
+                    if (
+                        analysis is not None
+                        and analysis["Rules Passed"] >= int(min_rules)
+                    ):
+                        results.append({
+                            "Symbol": symbol,
+                            **analysis,
+                        })
 
-                result = scan(symbol)
+                except Exception:
+                    continue
 
-                if result:
-                    rows.append(result)
-
-            except Exception:
-
-                errors += 1
-
-            progress.progress(
-                i / len(selected)
-            )
-
-        status.empty()
-
-        progress.empty()
-
-
-        # RESULTS
-
-        if rows:
-
-            output = pd.DataFrame(rows)
-
-            output = output.sort_values(
-                [
-                    "Passed",
-                    "Breakout + volume",
-                    "Near pivot"
-                ],
-                ascending=[
-                    False,
-                    False,
-                    False
-                ]
-            )
-
-            st.success(
-                f"{len(output)} stocks passed "
-                f"3 or more rules."
-            )
-
-            st.dataframe(
-                output,
-                use_container_width=True,
-                hide_index=True
-            )
-
-            st.download_button(
-                "⬇️ Download V2 CSV",
-
-                output.to_csv(
-                    index=False
-                ).encode(),
-
-                "nse_vcp_v2_candidates.csv",
-
-                "text/csv"
-            )
-
-        else:
-
-            st.info(
-                "No stock passed 3 or more "
-                "rules in the scanned universe."
-            )
-
-        if errors:
-
+        except Exception as e:
             st.warning(
-                f"{errors} symbols could not be read "
-                f"and were skipped."
+                f"Batch starting at {start + 1} failed: {e}"
             )
 
+        progress.progress(
+            min(1.0, (start + len(batch)) / total)
+        )
 
-# RULE DESCRIPTION
+        time.sleep(0.2)
+
+    status.write("Scan complete.")
+
+    if results:
+        result_df = pd.DataFrame(results)
+
+        result_df = result_df.sort_values(
+            by=["Rules Passed", "Symbol"],
+            ascending=[False, True],
+        )
+
+        st.success(
+            f"{len(result_df)} stocks passed at least "
+            f"{int(min_rules)} rules."
+        )
+
+        st.dataframe(
+            result_df,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "⬇️ Download results CSV",
+            result_df.to_csv(index=False).encode("utf-8"),
+            "nse_vcp_v3_results.csv",
+            "text/csv",
+        )
+
+    else:
+        st.warning(
+            "No stocks passed the minimum rule count. "
+            "This does not mean the market has no VCPs; "
+            "it means the current mechanical rules/data "
+            "did not produce a qualifying result."
+        )
+
 
 st.divider()
 
-st.markdown(
-"""
-### V2 Rules
+st.subheader("Final V3 rules")
 
-**Rule 1 — Trend Template**
+st.markdown("""
+**R1 — Contractions**
+- Daily chart.
+- Last 100 trading sessions.
+- 2 or 3 genuine contractions.
+- Contractions must be separate swing structures.
+- One sideways range must not be split into fake contractions.
+- Later contraction depth should be tighter than the earlier one.
 
-Price > 150 SMA > 200 SMA,  
-200 SMA rising,  
-50 SMA > 150 SMA,  
-price ≥ 75% of 52-week high.
+**R2 — Volume**
+- Volume should progressively dry up inside the contraction structures.
 
-**Rule 2 — VCP Contraction**
+**R3 — Price location**
+- Current price should be near the contraction/previous high.
+- The 0–10–20% proximity idea is implemented with 20% as the outer tolerance.
 
-C1 → C2 → C3 progressively tighter.
+**R4 — Moving averages**
+- Price > 50 SMA.
+- 50 SMA > 100 SMA.
 
-**Rule 3 — ATR Contraction**
+**Minimum result**
+- Only stocks passing at least 3 of the 4 rules are displayed.
+- Every displayed stock shows PASS/FAIL for every rule.
 
-Recent ATR% is lower than the preceding period.
+**EMA**
+- EMA is informational only:
+  - Price > 50 EMA
+  - Price > 100 EMA
+  - 50 EMA > 100 EMA
 
-**Rule 4 — Volume Dry-up**
-
-Recent average volume is below 85% of the preceding period.
-
-**Rule 5 — Near Pivot**
-
-Price is within 0–8% below the 20-day pivot.
-
-**Rule 6 — Breakout + Volume**
-
-Price breaks above pivot with volume ≥ 1.5× 20-day average.
-
----
-
-### RESULT CONDITION
-
-A stock is displayed only when it passes:
-
-**3 or more out of 6 rules.**
-
-The result also shows exactly which rules were **PASS** and which were **FAIL**.
-"""
-)
-
-st.caption(
-    "Screening tool only; not financial advice. "
-    "Market data may be delayed, incomplete, or rate-limited."
-    )
+**Cup-with-Handle**
+- Daily and weekly indications are shown after filtering.
+- Cup-with-Handle is NOT used as a filter.
+""")
